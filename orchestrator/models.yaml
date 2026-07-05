@@ -1,0 +1,63 @@
+# Model registry: every entry runs through the SAME `claude` CLI + Claude
+# Code engine (same tools, same Elastic skills) -- only the backend model
+# differs. `native: true` means direct Anthropic auth (the OAuth token in
+# harness/.secrets/); anything else routes through a fresh per-run
+# claude-code-router instance (see ccr_manager.py) pointed at that
+# provider's own API, so gpt-5.5, grok-4.3, and any future local model
+# all get an identical harness/toolset, just a different brain behind it.
+#
+# For routed entries, save the provider's API key at
+# harness/.secrets/<api_key_env>.txt (chmod 600) -- never embedded in the
+# generated per-run ccr config.json, only injected as a process env var.
+#
+# NOTE on gpt-5.5: live-verified working end to end (2/2 on the infra spike
+# scenario, real OpenAI backend, MCP proctor tools reachable and used
+# correctly). Needed a custom transformer -- ccr has no built-in "openai"
+# transformer (real roster: anthropic/deepseek/gemini/openrouter/groq/
+# maxtoken/tooluse/gemini-cli/reasoning/sampling/enhancetool/cleancache/
+# vertex-gemini/chutes-glm/qwen-cli/rovo-cli -- no "openai" entry), so two of
+# OpenAI's Chat Completions quirks needed handling by hand: (1) Claude
+# Code's extended-thinking `reasoning` field isn't recognized by OpenAI (400
+# "Unknown parameter") -- the built-in "reasoning" transformer doesn't help
+# either, it targets Qwen/vLLM-style `thinking`/`enable_thinking` fields,
+# not OpenAI's; (2) `max_tokens` was renamed to `max_completion_tokens` for
+# this model family (400 "Unsupported parameter") -- ccr's built-in
+# "maxtoken" transformer only clamps an existing max_tokens value, it
+# doesn't rename it. Both fixed in ccr_transformers/openai-reasoning-fix.js.
+#
+# transformer_path below is relative to the harness/ directory --
+# ccr_manager.py resolves it to an absolute path before writing ccr's config.
+
+claude-sonnet-5:
+  native: true
+  model: claude-sonnet-5
+  effort: xhigh
+
+gpt-5.5:
+  native: false
+  provider_name: openai
+  api_base_url: https://api.openai.com/v1/chat/completions
+  api_key_env: OPENAI_API_KEY
+  model: gpt-5.5
+  transformer: openai-reasoning-fix
+  transformer_path: ccr_transformers/openai-reasoning-fix.js
+
+grok-4.3:
+  native: false
+  provider_name: xai
+  api_base_url: https://api.x.ai/v1/chat/completions
+  api_key_env: XAI_API_KEY
+  model: grok-4.3
+  transformer: xai-high-effort
+  transformer_path: ccr_transformers/xai-high-effort.js
+  effort: high
+
+# Template for a local OpenAI-compatible server (Ollama/vLLM/LM Studio/...).
+# Uncomment and adjust; most local servers don't check the key at all, so a
+# dummy placeholder file is fine.
+# local-example:
+#   native: false
+#   provider_name: local
+#   api_base_url: http://localhost:11434/v1/chat/completions
+#   api_key_env: LOCAL_DUMMY_KEY
+#   model: llama3.1:70b
