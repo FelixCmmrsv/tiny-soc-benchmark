@@ -1,32 +1,64 @@
-# Model registry: every entry runs through the SAME `claude` CLI + Claude
-# Code engine (same tools, same Elastic skills) -- only the backend model
-# differs. `native: true` means direct Anthropic auth (the OAuth token in
-# harness/.secrets/); anything else routes through a fresh per-run
-# claude-code-router instance (see ccr_manager.py) pointed at that
-# provider's own API, so gpt-5.5, grok-4.3, and any future local model
-# all get an identical harness/toolset, just a different brain behind it.
+# ============================================================================
+# Model registry -- add ANY vendor here.
+# ============================================================================
+# Every entry runs through the SAME `claude` CLI + Claude Code engine (same
+# tools, same Elastic skills, same MCP proctor) -- only the backend model
+# differs, so scores are comparable across vendors. Two kinds of entry:
 #
-# For routed entries, save the provider's API key at
-# harness/.secrets/<api_key_env>.txt (chmod 600) -- never embedded in the
-# generated per-run ccr config.json, only injected as a process env var.
+#   native: true    -> talks to Anthropic directly, using the OAuth token in
+#                      .secrets/claude_oauth_token.txt.
 #
-# NOTE on gpt-5.5: live-verified working end to end (2/2 on the infra spike
-# scenario, real OpenAI backend, MCP proctor tools reachable and used
-# correctly). Needed a custom transformer -- ccr has no built-in "openai"
-# transformer (real roster: anthropic/deepseek/gemini/openrouter/groq/
-# maxtoken/tooluse/gemini-cli/reasoning/sampling/enhancetool/cleancache/
-# vertex-gemini/chutes-glm/qwen-cli/rovo-cli -- no "openai" entry), so two of
-# OpenAI's Chat Completions quirks needed handling by hand: (1) Claude
-# Code's extended-thinking `reasoning` field isn't recognized by OpenAI (400
-# "Unknown parameter") -- the built-in "reasoning" transformer doesn't help
-# either, it targets Qwen/vLLM-style `thinking`/`enable_thinking` fields,
-# not OpenAI's; (2) `max_tokens` was renamed to `max_completion_tokens` for
-# this model family (400 "Unsupported parameter") -- ccr's built-in
-# "maxtoken" transformer only clamps an existing max_tokens value, it
-# doesn't rename it. Both fixed in ccr_transformers/openai-reasoning-fix.js.
+#   routed (default) -> a fresh per-run claude-code-router (ccr) instance is
+#                      pointed at the provider's OpenAI-compatible endpoint.
+#                      Works for any OpenAI-compatible API: other clouds
+#                      (OpenAI, xAI, Google, DeepSeek, OpenRouter, Groq, ...)
+#                      and local servers (Ollama, vLLM, LM Studio, ...).
 #
-# transformer_path below is relative to the harness/ directory --
-# ccr_manager.py resolves it to an absolute path before writing ccr's config.
+# ---- Schema for a routed entry --------------------------------------------
+#   <your-name>:                 # what you pass to --model
+#     native: false
+#     provider_name: <label>     # any label; names the ccr provider
+#     api_base_url: <url>        # the OpenAI-compatible chat-completions URL
+#     api_key_env: <NAME>        # -> the key is read from .secrets/<NAME>.txt
+#     model: <upstream-model-id>
+#     transformer: <name>        # optional, see "Transformers" below
+#     transformer_path: <path>   # optional; only for CUSTOM transformers,
+#                                # relative to harness/ (ccr_manager resolves it)
+#     effort: <low|medium|high|xhigh|max>   # optional
+#
+# The API key is read from .secrets/<api_key_env>.txt (chmod 600) and injected
+# only as a per-run env var -- never written into ccr's generated config on
+# disk. Run `run_benchmark.py --list-models` to see, per model, which secret
+# file it needs and whether it's present.
+#
+# ---- Transformers (reconcile Claude Code's request shape with the target) --
+# Claude Code always sends an Anthropic-style request incl. a `reasoning`
+# field. ccr rewrites it to the target provider via a transformer. Pick one:
+#
+#   * OpenAI's own reasoning models (gpt-5.x, o-series):
+#         transformer: openai-reasoning-fix
+#         transformer_path: ccr_transformers/openai-reasoning-fix.js
+#     (strips `reasoning`, and renames max_tokens -> max_completion_tokens)
+#
+#   * Any other OpenAI-compatible endpoint (DeepSeek, Together, local vLLM/
+#     Ollama/LM Studio, OpenRouter in OpenAI format, ...):
+#         transformer: strip-reasoning
+#         transformer_path: ccr_transformers/strip-reasoning.js
+#     (strips `reasoning`; keeps max_tokens -- the safe generic default)
+#
+#   * xAI (grok):
+#         transformer: xai-high-effort
+#         transformer_path: ccr_transformers/xai-high-effort.js
+#
+#   * Providers ccr has a BUILT-IN transformer for (no transformer_path
+#     needed): gemini, deepseek, groq, openrouter, vertex-gemini, ...
+#         transformer: gemini
+#
+#   * A lenient server that accepts unknown fields: omit `transformer` entirely.
+# ============================================================================
+
+
+# ---- Working, verified entries --------------------------------------------
 
 claude-sonnet-5:
   native: true
@@ -52,12 +84,50 @@ grok-4.3:
   transformer_path: ccr_transformers/xai-high-effort.js
   effort: high
 
-# Template for a local OpenAI-compatible server (Ollama/vLLM/LM Studio/...).
-# Uncomment and adjust; most local servers don't check the key at all, so a
-# dummy placeholder file is fine.
-# local-example:
+
+# ---- Ready-to-use examples (uncomment, drop the key in .secrets/, run) -----
+# These are templates, not verified end to end -- treat the transformer choice
+# as a starting point and adjust if the provider 400s on the first call.
+
+# gemini-2.5-pro:
+#   native: false
+#   provider_name: gemini
+#   api_base_url: https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+#   api_key_env: GEMINI_API_KEY
+#   model: gemini-2.5-pro
+#   transformer: gemini                 # ccr built-in, no transformer_path
+
+# deepseek-reasoner:
+#   native: false
+#   provider_name: deepseek
+#   api_base_url: https://api.deepseek.com/chat/completions
+#   api_key_env: DEEPSEEK_API_KEY
+#   model: deepseek-reasoner
+#   transformer: deepseek               # ccr built-in, no transformer_path
+
+# openrouter-any:
+#   native: false
+#   provider_name: openrouter
+#   api_base_url: https://openrouter.ai/api/v1/chat/completions
+#   api_key_env: OPENROUTER_API_KEY
+#   model: qwen/qwen-2.5-72b-instruct   # any model OpenRouter exposes
+#   transformer: openrouter             # ccr built-in, no transformer_path
+
+# groq-llama:
+#   native: false
+#   provider_name: groq
+#   api_base_url: https://api.groq.com/openai/v1/chat/completions
+#   api_key_env: GROQ_API_KEY
+#   model: llama-3.3-70b-versatile
+#   transformer: groq                   # ccr built-in, no transformer_path
+
+# Local OpenAI-compatible server (Ollama / vLLM / LM Studio / llama.cpp).
+# Most don't check the key; put any placeholder in .secrets/LOCAL_KEY.txt.
+# local-llama:
 #   native: false
 #   provider_name: local
-#   api_base_url: http://localhost:11434/v1/chat/completions
-#   api_key_env: LOCAL_DUMMY_KEY
-#   model: llama3.1:70b
+#   api_base_url: http://localhost:11434/v1/chat/completions   # Ollama default
+#   api_key_env: LOCAL_KEY
+#   model: llama3.3:70b
+#   transformer: strip-reasoning
+#   transformer_path: ccr_transformers/strip-reasoning.js

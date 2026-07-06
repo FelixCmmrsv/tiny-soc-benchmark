@@ -127,20 +127,21 @@ docker compose up -d --wait
 # ... place your scenario telemetry JSON under telemetry/data/ ...
 cd -
 
-# Auth: this harness runs `claude` as a subprocess with a token, not your
-# interactive login session (an OAuth session from `claude auth login` does
-# not carry over into a scripted CLAUDE_CONFIG_DIR — confirmed empirically,
-# not documented behavior). Run:
+# Auth for the native Anthropic model: this harness runs `claude` as a
+# subprocess with a token, not your interactive login session (an OAuth
+# session from `claude auth login` does not carry over into a scripted
+# CLAUDE_CONFIG_DIR — confirmed empirically, not documented behavior). Run:
 claude setup-token
 # then save the resulting token:
 mkdir -p harness/.secrets && chmod 700 harness/.secrets
 echo "<token>" > harness/.secrets/claude_oauth_token.txt
 chmod 600 harness/.secrets/claude_oauth_token.txt
 
-# For every non-native model in models.yaml, save its API key the same way,
-# named after that entry's api_key_env, e.g.:
+# Keys for the routed (non-Anthropic) models: `--list-models` prints exactly
+# which secret file each configured model needs and whether it's present.
+python3 harness/orchestrator/run_benchmark.py --list-models
+# Create the ones marked "NO" (path shown), e.g.:
 echo "<your key>" > harness/.secrets/OPENAI_API_KEY.txt
-echo "<your key>" > harness/.secrets/XAI_API_KEY.txt
 chmod 600 harness/.secrets/*.txt
 
 # Build the scrubbed config-dir template every run copies from:
@@ -156,6 +157,38 @@ bash harness/tools/install_skills.sh
 Re-run `seed_templates.py` any time you re-authenticate; re-run
 `compile_manifest.py --all` any time you edit a `manifest.source.yaml`;
 re-run `install_skills.sh` to refresh skills to the latest upstream.
+
+## Benchmarking any model / vendor
+
+Three models ship configured (claude-sonnet-5 native, gpt-5.5 and grok-4.3
+routed). Any other model — a different cloud vendor or a locally hosted
+open-weight model — is one `models.yaml` entry plus one key file, no code
+changes:
+
+1. Add an entry to `orchestrator/models.yaml`. Its header documents the
+   schema and carries ready-to-uncomment examples for Gemini, DeepSeek,
+   OpenRouter, Groq, and a local Ollama/vLLM/LM Studio server. The essentials
+   for a routed model:
+   ```yaml
+   my-model:
+     native: false
+     provider_name: myprovider
+     api_base_url: https://api.myprovider.com/v1/chat/completions   # OpenAI-compatible
+     api_key_env: MYPROVIDER_API_KEY        # -> .secrets/MYPROVIDER_API_KEY.txt
+     model: the-upstream-model-id
+     transformer: strip-reasoning           # safe default for OpenAI-compatible APIs
+     transformer_path: ccr_transformers/strip-reasoning.js
+   ```
+2. Drop the provider's key at `.secrets/<api_key_env>.txt` (chmod 600).
+   `--list-models` confirms it's found.
+3. Run it: `--model my-model` (mix and match: `--model claude-sonnet-5 my-model`).
+
+Every routed model goes through the same `claude` engine, tools, and skills
+as the native one — only the backend LLM differs, so scores stay comparable.
+The only per-vendor wrinkle is the **transformer** that reconciles Claude
+Code's request shape with the target API; `models.yaml`'s header explains
+which to pick (a built-in ccr one, the generic `strip-reasoning`, or a custom
+one like `openai-reasoning-fix` for OpenAI's reasoning models).
 
 ## Running it
 
@@ -306,7 +339,7 @@ provider API keys in plaintext during testing; it's disabled at the source
 
 - Cost/usage tracking is accurate for native models only (see "Output" above).
 - Process-level isolation only — see "Security model" above.
-- No forensics-tooling capability profile yet for scenarios needing more
-  than Elasticsearch queries (disk-image/binary analysis).
-- `grok-4.3` routing is implemented but not live-tested end-to-end (needs an
-  `XAI_API_KEY`); `gpt-5.5` is live-verified.
+- The `elastic-forensics` capability profile checks for the required tools but
+  runs them on the host; there's no containerized forensics sandbox yet, and
+  the disk-image half of the supply-chain scenario hasn't been run end-to-end
+  with a live model.

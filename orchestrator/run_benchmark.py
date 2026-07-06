@@ -36,7 +36,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 HARNESS = REPO_ROOT / "harness"
 SCENARIOS_DIR = HARNESS / "scenarios"
 MODELS_YAML = HARNESS / "orchestrator" / "models.yaml"
-CLAUDE_OAUTH_TOKEN_FILE = HARNESS / ".secrets" / "claude_oauth_token.txt"
+SECRETS_DIR = HARNESS / ".secrets"
+CLAUDE_OAUTH_TOKEN_FILE = SECRETS_DIR / "claude_oauth_token.txt"
 
 
 def load_claude_oauth_token():
@@ -67,6 +68,32 @@ def load_models():
 
 def list_scenarios():
     return sorted(p.name for p in SCENARIOS_DIR.iterdir() if (p / "manifest.yaml").exists())
+
+
+def print_models():
+    """Show every configured model, its backend, the secret file it needs,
+    and whether that secret is present. The generic 'what do I need to run
+    this model' interface -- works for any vendor added to models.yaml."""
+    models = load_models()
+    if not models:
+        print("No models configured in %s" % MODELS_YAML)
+        return
+    print("%-22s %-26s %-42s %s" % ("MODEL", "BACKEND", "SECRET FILE", "PRESENT"))
+    for name, cfg in models.items():
+        if cfg.get("native"):
+            backend = "native (Anthropic)"
+            secret = CLAUDE_OAUTH_TOKEN_FILE
+        else:
+            backend = "routed -> %s:%s" % (cfg.get("provider_name", "?"), cfg.get("model", "?"))
+            secret = SECRETS_DIR / ((cfg.get("api_key_env") or "MISSING_api_key_env") + ".txt")
+        present = "yes" if secret.exists() else "NO  <-- create it"
+        try:
+            secret_disp = str(secret.relative_to(REPO_ROOT))
+        except ValueError:
+            secret_disp = str(secret)
+        print("%-22s %-26s %-42s %s" % (name, backend, secret_disp, present))
+    print("\nAdd a model: edit %s (see its header), then drop the provider's API key\n"
+          "at the SECRET FILE path above (chmod 600)." % str(MODELS_YAML.relative_to(REPO_ROOT)))
 
 
 def build_initial_prompt(manifest, conn):
@@ -303,6 +330,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep-workdir", action="store_true")
     ap.add_argument("--list-scenarios", action="store_true")
+    ap.add_argument("--list-models", action="store_true",
+                     help="Show configured models, their backend, and which .secrets/ key file "
+                          "each needs (and whether it's present), then exit.")
     ap.add_argument("--es-url", default=None,
                      help="Override the Elasticsearch URL (else elastic/.env's ELASTICSEARCH_URL, "
                           "else http://localhost:9200).")
@@ -316,8 +346,12 @@ def main():
             print(s)
         return
 
+    if args.list_models:
+        print_models()
+        return
+
     if not args.scenario or not args.model:
-        ap.error("--scenario and --model are required (or use --list-scenarios)")
+        ap.error("--scenario and --model are required (or use --list-scenarios / --list-models)")
 
     models = load_models()
     for m in args.model:
