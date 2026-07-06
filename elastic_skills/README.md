@@ -17,16 +17,34 @@ still get shell access and can query Elasticsearch/Kibana directly with
 
 ## Populating it
 
-Each entry in `skills-lock.json` names a skill, its upstream
-(`source: elastic/agent-skills`, `sourceType: github`), the path to its
-`SKILL.md` within that repo, and a `computedHash` pinning the exact content.
-Fetch the 35 skills listed there into per-skill subdirectories here:
+**Easiest — one command:**
+
+```
+bash tools/install_skills.sh
+```
+
+This wraps the [`skills`](https://www.npmjs.com/package/skills) CLI
+(`npx skills add elastic/agent-skills --all`), fetches the 35 skills into
+this directory, and refreshes `skills-lock.json`. Requires `node`/`npx` and
+network access to `github.com/elastic/agent-skills`.
+
+**Or run the `skills` CLI directly** if you already use it — e.g.
+
+```
+npx skills add elastic/agent-skills --all
+```
+
+installs into your project's `.claude/skills/`; point the harness at it with
+`HARNESS_ELASTIC_SKILLS_DIR=/path/to/.claude/skills` instead of copying into
+`elastic_skills/`.
+
+**Layout.** Whatever route you use, the harness expects one directory per
+skill, matching the `name:` in each `skills-lock.json` entry:
 
 ```
 elastic_skills/<skill-name>/SKILL.md   (plus that skill's scripts/, references/, etc.)
 ```
 
-so the layout matches the `name:` in each lock entry (e.g.
-`elastic_skills/security-alert-triage/SKILL.md`). Use whatever skill-install
-tooling you normally use with the Elastic agent-skills repo; the lock file is
-there so the exact versions are reproducible.
+Each lock entry names the skill, its upstream (`source: elastic/agent-skills`,
+`sourceType: github`), the path to its `SKILL.md` in that repo, and a
+`computedHash` pinning the exact content — so versions are reproducible.

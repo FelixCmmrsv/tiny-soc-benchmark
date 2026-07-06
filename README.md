@@ -148,10 +148,14 @@ python3 harness/tools/seed_templates.py
 
 # Compile any scenario manifest you've authored/edited:
 python3 harness/tools/compile_manifest.py --all
+
+# (Optional) give every model the pre-built Elastic skills:
+bash harness/tools/install_skills.sh
 ```
 
 Re-run `seed_templates.py` any time you re-authenticate; re-run
-`compile_manifest.py --all` any time you edit a `manifest.source.yaml`.
+`compile_manifest.py --all` any time you edit a `manifest.source.yaml`;
+re-run `install_skills.sh` to refresh skills to the latest upstream.
 
 ## Running it
 
@@ -169,11 +173,20 @@ python3 harness/orchestrator/run_benchmark.py \
   --max-budget-usd 10 --timeout-minutes 60
 ```
 
-Useful flags: `--no-recreate-elastic` (skip the Elastic reload, e.g. for
-repeat runs against data you know is already loaded), `--keep-workdir`
-(keep the per-run scrubbed config dirs/workdir for debugging instead of
-deleting them after grading — `proctor_state/results.jsonl`,
-`transcript.jsonl`, and `result_summary.json` are always kept regardless).
+Useful flags:
+- `--no-recreate-elastic` — skip the Elastic reload (repeat runs against data
+  you know is already loaded).
+- `--no-compose` — don't start the local Docker stack; target an existing /
+  remote cluster (configure it in `elastic/.env`, or with the two flags below).
+  See `elastic/README.md` → "Option B".
+- `--es-url` / `--kibana-url` — override the cluster URLs for this run
+  (precedence: these flags → `elastic/.env` → localhost default).
+- `--keep-workdir` — keep the per-run scrubbed config dirs/workdir for
+  debugging instead of deleting them after grading (`proctor_state/results.jsonl`,
+  `transcript.jsonl`, and `result_summary.json` are always kept regardless).
+
+`--dry-run` is fully side-effect-free: it prints the exact command that would
+run and does not touch Elasticsearch, start `ccr`, or spend anything.
 
 ### Output
 

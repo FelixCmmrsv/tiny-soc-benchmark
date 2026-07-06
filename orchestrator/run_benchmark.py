@@ -36,7 +36,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 HARNESS = REPO_ROOT / "harness"
 SCENARIOS_DIR = HARNESS / "scenarios"
 MODELS_YAML = HARNESS / "orchestrator" / "models.yaml"
-ENV_FILE = REPO_ROOT / "elastic" / ".env"
 CLAUDE_OAUTH_TOKEN_FILE = HARNESS / ".secrets" / "claude_oauth_token.txt"
 
 
@@ -50,19 +49,6 @@ def load_claude_oauth_token():
             "(chmod 600)." % CLAUDE_OAUTH_TOKEN_FILE
         )
     return CLAUDE_OAUTH_TOKEN_FILE.read_text().strip()
-
-
-def load_env_file(path):
-    env = {}
-    if not path.exists():
-        return env
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        env[k.strip()] = v.strip()
-    return env
 
 
 def load_manifest(scenario_id):
@@ -83,17 +69,29 @@ def list_scenarios():
     return sorted(p.name for p in SCENARIOS_DIR.iterdir() if (p / "manifest.yaml").exists())
 
 
-def build_initial_prompt(manifest, es_url, kibana_url):
+def build_initial_prompt(manifest, conn):
+    if conn["auth_method"] == "apikey":
+        auth_hint = (
+            "Authenticate to Elasticsearch with header "
+            "`Authorization: ApiKey $ES_API_KEY` (env var already set -- "
+            "don't ask for it, don't print it)."
+        )
+    elif conn["auth_method"] == "basic":
+        auth_hint = (
+            "Authenticate to Elasticsearch with HTTP basic auth using "
+            "`-u \"$ES_USER:$ES_PASSWORD\"` (env vars already set -- don't "
+            "ask for them, don't print them)."
+        )
+    else:
+        auth_hint = "Elasticsearch requires no authentication in this environment."
     return (
         "You are the on-call SOC analyst for this benchmark. Elasticsearch is at "
-        "%s (Kibana at %s). Authenticate to Elasticsearch with header "
-        '`Authorization: ApiKey $ES_API_KEY` (already set in your shell '
-        "environment -- don't ask for it, don't print it). "
+        "%s (Kibana at %s). %s "
         "Call the proctor's get_current_step tool now to receive your first task."
-    ) % (es_url, kibana_url)
+    ) % (conn["es_url"], conn["kibana_url"], auth_hint)
 
 
-def build_claude_command(run, model_cfg, manifest, max_budget_usd, es_url, kibana_url, ccr_handle=None):
+def build_claude_command(run, model_cfg, manifest, max_budget_usd, conn, ccr_handle=None):
     """Every model -- native Anthropic or routed through ccr to any other
     provider -- goes through this SAME claude CLI invocation shape (same
     tools, same skills, same MCP proctor). Only auth/model-selection differs:
@@ -102,7 +100,7 @@ def build_claude_command(run, model_cfg, manifest, max_budget_usd, es_url, kiban
     ccr's "<provider>,<model>" router key as --model instead.
     """
     system_addendum = (HARNESS / "proctor" / "system_prompt_addendum.txt").read_text()
-    prompt = build_initial_prompt(manifest, es_url, kibana_url)
+    prompt = build_initial_prompt(manifest, conn)
 
     model_arg = ccr_handle["router_key"] if ccr_handle else model_cfg["model"]
 
@@ -133,15 +131,20 @@ def build_claude_command(run, model_cfg, manifest, max_budget_usd, es_url, kiban
     else:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = load_claude_oauth_token()
 
-    env_file = load_env_file(ENV_FILE)
-    for key in ("ES_API_KEY", "ELASTIC_PASSWORD", "KIBANA_SYSTEM_PASSWORD"):
-        if key in env_file:
-            env[key] = env_file[key]
+    # Give the agent the ES credentials its prompt references. Whichever auth
+    # method is configured, expose both the raw values it needs -- ES_API_KEY
+    # for the apikey path, ES_USER/ES_PASSWORD for basic auth.
+    if conn["es_api_key"]:
+        env["ES_API_KEY"] = conn["es_api_key"]
+    if conn["es_user"]:
+        env["ES_USER"] = conn["es_user"]
+    if conn["es_password"]:
+        env["ES_PASSWORD"] = conn["es_password"]
 
     return cmd, env
 
 
-def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args):
+def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, conn):
     print("\n=== Job: scenario=%s model=%s ===" % (scenario_id, model_name))
 
     # One anchor for this whole job, shared by the Elastic reset and the
@@ -150,8 +153,12 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args):
     # slightly different wall-clock moments.
     anchor = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-    if not args.no_recreate_elastic:
-        elastic_lifecycle.reset_scenario_data(manifest, anchor)
+    if args.dry_run:
+        pass  # dry-run is side-effect-free: no Elastic reset, no ccr, no agent
+    elif not args.no_recreate_elastic:
+        elastic_lifecycle.reset_scenario_data(
+            manifest, anchor, es_url=conn["es_url"], kibana_url=conn["kibana_url"],
+            no_compose=args.no_compose)
     else:
         print("[run_benchmark] skipping Elastic reset (--no-recreate-elastic)")
 
@@ -164,7 +171,7 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args):
         router_key = "%s,%s" % (model_cfg["provider_name"], model_cfg["model"]) if not model_cfg.get("native") else None
         fake_ccr_handle = {"port": "<ccr-port>", "router_key": router_key} if router_key else None
         cmd, env = build_claude_command(run, model_cfg, manifest, args.max_budget_usd,
-                                         args.es_url, args.kibana_url, fake_ccr_handle)
+                                         conn, fake_ccr_handle)
         print("[dry-run] would execute:")
         print(" ".join(_shell_quote(c) for c in cmd))
         print("[dry-run] CLAUDE_CONFIG_DIR=%s" % env["CLAUDE_CONFIG_DIR"])
@@ -183,7 +190,7 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args):
                   % (ccr_handle["port"], ccr_handle["router_key"]))
 
         cmd, env = build_claude_command(run, model_cfg, manifest, args.max_budget_usd,
-                                         args.es_url, args.kibana_url, ccr_handle)
+                                         conn, ccr_handle)
 
         transcript_path = run["run_dir"] / "transcript.jsonl"
         stderr_path = run["run_dir"] / "stderr.log"
@@ -289,11 +296,19 @@ def main():
     ap.add_argument("--max-budget-usd", type=float, default=5.0)
     ap.add_argument("--timeout-minutes", type=float, default=45)
     ap.add_argument("--no-recreate-elastic", action="store_true")
+    ap.add_argument("--no-compose", action="store_true",
+                     help="Don't run the local `docker compose up`; target an already-running "
+                          "or remote Elasticsearch/Kibana (configure its URL/auth in elastic/.env "
+                          "or via --es-url/--kibana-url).")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep-workdir", action="store_true")
     ap.add_argument("--list-scenarios", action="store_true")
-    ap.add_argument("--es-url", default="http://localhost:9200")
-    ap.add_argument("--kibana-url", default="http://127.0.0.1:5601")
+    ap.add_argument("--es-url", default=None,
+                     help="Override the Elasticsearch URL (else elastic/.env's ELASTICSEARCH_URL, "
+                          "else http://localhost:9200).")
+    ap.add_argument("--kibana-url", default=None,
+                     help="Override the Kibana URL (else elastic/.env's KIBANA_URL, else "
+                          "http://127.0.0.1:5601).")
     args = ap.parse_args()
 
     if args.list_scenarios:
@@ -314,9 +329,16 @@ def main():
         if missing:
             ap.error("models.yaml entry %r missing required field(s): %s" % (m, missing))
 
-    ok, msg = elastic_lifecycle.docker_available()
-    if not ok:
-        ap.error("Docker preflight failed: %s" % msg)
+    # Resolve the ES/Kibana connection once (CLI > elastic/.env > default) and
+    # reuse it for the data reload, the agent prompt, and credential injection.
+    conn = elastic_lifecycle.connection(args.es_url, args.kibana_url)
+    print("[run_benchmark] Elasticsearch=%s Kibana=%s auth=%s"
+          % (conn["es_url"], conn["kibana_url"], conn["auth_method"]))
+
+    if not args.no_compose:
+        ok, msg = elastic_lifecycle.docker_available()
+        if not ok:
+            ap.error("Docker preflight failed: %s (pass --no-compose to target an existing cluster)" % msg)
 
     manifests = {}
     for scenario_id in args.scenario:
@@ -332,7 +354,7 @@ def main():
         manifest, manifest_path = manifests[scenario_id]
         for model_name in args.model:
             model_cfg = models[model_name]
-            summary = run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args)
+            summary = run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, conn)
             if summary:
                 summaries.append(summary)
                 print("[run_benchmark] %s x %s -> score %s (%d timed out=%s)"

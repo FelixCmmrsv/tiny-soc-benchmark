@@ -6,6 +6,7 @@ routed through ccr) uses this same Claude Code config -- there's no
 separate per-vendor config dir.
 """
 import json
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -17,9 +18,12 @@ TEMPLATES = HARNESS / "templates"
 PROCTOR_SCRIPT = HARNESS / "proctor" / "proctor_server.py"
 # Elastic's official agent-skill packs, copied into every run's workdir so
 # every model -- regardless of which backend answers via ccr -- starts with
-# identical capabilities, not just raw Bash+curl. Bundled in-repo (not
-# sourced from an external scratch directory) so the harness is self-contained.
-ELASTIC_SKILLS_SRC = HARNESS / "elastic_skills"
+# identical capabilities, not just raw Bash+curl. Populate with
+# tools/install_skills.sh (see elastic_skills/README.md). Override the
+# location with HARNESS_ELASTIC_SKILLS_DIR to point at a skills dir you
+# installed elsewhere (e.g. a project-level .claude/skills/ from
+# `npx skills add`). Absent -> skills simply not seeded (soft dependency).
+ELASTIC_SKILLS_SRC = Path(os.environ.get("HARNESS_ELASTIC_SKILLS_DIR", str(HARNESS / "elastic_skills")))
 
 
 class IsolationError(RuntimeError):
