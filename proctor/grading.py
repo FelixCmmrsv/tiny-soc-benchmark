@@ -73,10 +73,20 @@ def _parse_timestamp(s):
         return float(n)
     import datetime
     s2 = s.replace("Z", "").replace("T", " ")
-    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+    # Handle fractional seconds of ANY length ourselves -- strptime's %f
+    # tops out at 6 digits (microseconds) and raises on more, which silently
+    # breaks NTFS-precision timestamps (7 digits / 100ns ticks) that show up
+    # in forensic MFT/file-metadata answers. Split it off, parse the whole-
+    # second part normally, add the fraction back as a float.
+    frac_seconds = 0.0
+    m = re.match(r"^(.*?)\.(\d+)$", s2)
+    if m:
+        s2, frac_digits = m.group(1), m.group(2)
+        frac_seconds = float("0." + frac_digits)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             dt = datetime.datetime.strptime(s2, fmt)
-            return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+            return dt.replace(tzinfo=datetime.timezone.utc).timestamp() + frac_seconds
         except ValueError:
             continue
     return None
@@ -112,7 +122,11 @@ def canonicalize(value, rule):
         return re.sub(r"\s+", "", s).lower()
     if rtype == "timestamp":
         epoch = _parse_timestamp(s)
-        return ("%.3f" % round(epoch, 3)) if epoch is not None else s
+        # 7 decimal places: some forensic answers (NTFS 100ns-tick MFT
+        # timestamps) need that precision -- rounding to milliseconds like an
+        # earlier version of this function did would silently accept a wrong
+        # answer that merely shares the same millisecond.
+        return ("%.7f" % epoch) if epoch is not None else s
     if rtype == "single_choice":
         cs = rule.get("case_sensitive", False)
         return s if cs else s.casefold()

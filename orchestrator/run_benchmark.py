@@ -26,6 +26,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import capability_profiles
 import ccr_manager
 import elastic_lifecycle
 import isolation
@@ -317,9 +318,18 @@ def main():
     if not ok:
         ap.error("Docker preflight failed: %s" % msg)
 
-    summaries = []
+    manifests = {}
     for scenario_id in args.scenario:
         manifest, manifest_path = load_manifest(scenario_id)
+        manifests[scenario_id] = (manifest, manifest_path)
+        try:
+            capability_profiles.require(manifest.get("capability_profile", "elastic-only"))
+        except capability_profiles.CapabilityError as e:
+            ap.error(str(e))
+
+    summaries = []
+    for scenario_id in args.scenario:
+        manifest, manifest_path = manifests[scenario_id]
         for model_name in args.model:
             model_cfg = models[model_name]
             summary = run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args)

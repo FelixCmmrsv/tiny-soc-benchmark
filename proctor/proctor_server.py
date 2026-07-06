@@ -20,11 +20,18 @@ import os
 import json
 import time
 import argparse
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from grading import grade, parse_timestamp_to_epoch
 
 PROTOCOL_VERSION = "2024-11-05"
+HARNESS = Path(__file__).resolve().parent.parent
+# Large scenario artifacts (disk images, pcaps -- can be many GB) are never
+# copied into the repo or the run's config dirs; the operator supplies them
+# once here, and the proctor symlinks the relevant one into the agent's
+# workdir only once the manifest says it's unlocked (see harness/scenario_artifacts/README.md).
+SCENARIO_ARTIFACTS_ROOT = HARNESS / "scenario_artifacts"
 
 TOOLS = [
     {
@@ -60,16 +67,43 @@ TOOLS = [
 
 
 class ProctorState:
-    def __init__(self, manifest, run_id, state_dir):
+    def __init__(self, manifest, run_id, state_dir, workdir=None):
         self.manifest = manifest
         self.run_id = run_id
         self.state_dir = state_dir
+        self.workdir = Path(workdir) if workdir else None
         self.steps = manifest["steps"]
         self.idx = 0
         self.started = False
         self.complete = False
         os.makedirs(state_dir, exist_ok=True)
         self.results_path = os.path.join(state_dir, "results.jsonl")
+
+    def _sync_artifacts(self):
+        """Symlink (not copy -- some of these are many GB) every artifact
+        unlocked as of the current step into the agent's workdir, if not
+        already there. Returns the mount_as names unlocked so far (earlier
+        artifacts stay listed/available once unlocked, matching how the
+        original scenario worked)."""
+        if not self.workdir:
+            return []
+        unlocked = []
+        scenario_root = SCENARIO_ARTIFACTS_ROOT / self.manifest["scenario_id"]
+        for a in self.manifest.get("artifacts", []):
+            if a["unlock_at_step"] > self.idx + 1:
+                continue
+            mount_as = a.get("mount_as") or Path(a["source_path"]).name
+            unlocked.append(mount_as)
+            dst = self.workdir / mount_as
+            if dst.exists() or dst.is_symlink():
+                continue
+            src = scenario_root / a["source_path"]
+            if not src.exists():
+                log_err("proctor: WARNING artifact source missing, not unlocked: %s" % src)
+                continue
+            os.symlink(src.resolve(), dst)
+            log_err("proctor: unlocked artifact %s -> %s" % (mount_as, src))
+        return unlocked
 
     def current_step_public(self):
         base = {
@@ -84,7 +118,7 @@ class ProctorState:
                 question_text=None,
                 action_text=None,
                 format_hint=None,
-                unlocked_artifacts=[],
+                unlocked_artifacts=self._sync_artifacts(),
                 briefing=None,
             )
             return base
@@ -95,7 +129,7 @@ class ProctorState:
             question_text=step["question"],
             action_text=step.get("action_text", ""),
             format_hint=step.get("format_hint"),
-            unlocked_artifacts=step.get("_unlocked_artifacts", []),
+            unlocked_artifacts=self._sync_artifacts(),
             briefing=self.manifest.get("briefing") if not self.started else None,
         )
         return base
@@ -286,6 +320,9 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--state-dir", required=True)
+    ap.add_argument("--workdir", default=None,
+                     help="Agent's sandbox workdir -- required only if the manifest has an "
+                          "'artifacts' list, so unlocked artifacts can be symlinked in.")
     ap.add_argument("--anchor", default=None,
                      help="ISO timestamp used as the scenario's 'ends now' anchor for this run "
                           "(same value passed to upload.sh --anchor) -- needed to grade any "
@@ -294,7 +331,7 @@ def main():
 
     manifest = load_manifest(args.manifest)
     materialize_shifted_timestamps(manifest, args.anchor)
-    state = ProctorState(manifest, args.run_id, args.state_dir)
+    state = ProctorState(manifest, args.run_id, args.state_dir, args.workdir)
     log_err(
         "proctor: loaded scenario=%s steps=%d run_id=%s state_dir=%s"
         % (manifest["scenario_id"], len(manifest["steps"]), args.run_id, args.state_dir)

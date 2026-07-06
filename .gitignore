@@ -21,5 +21,11 @@ elastic/.env
 elastic/telemetry/data/
 elastic/telemetry/data_*/
 
+# Large binary scenario artifacts (disk images, pcaps) referenced by a
+# manifest's `artifacts:` list -- same content-provenance reasoning as the
+# Elastic telemetry above. Supply your own; see scenario_artifacts/README.md.
+scenario_artifacts/*/
+!scenario_artifacts/README.md
+
 __pycache__/
 *.pyc

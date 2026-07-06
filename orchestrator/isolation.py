@@ -60,7 +60,7 @@ def create_run(scenario_id, model_name, manifest_path, anchor):
 
     claude_config = _materialize(TEMPLATES / "claude_config_template", run_dir / "claude_config")
 
-    mcp_config_path = _write_mcp_config(run_dir, manifest_path, run_id, state_dir, anchor)
+    mcp_config_path = _write_mcp_config(run_dir, manifest_path, run_id, state_dir, anchor, workdir)
 
     return {
         "run_id": run_id,
@@ -90,7 +90,7 @@ def _materialize(template_dir, dest_dir):
     return dest_dir
 
 
-def _write_mcp_config(run_dir, manifest_path, run_id, state_dir, anchor):
+def _write_mcp_config(run_dir, manifest_path, run_id, state_dir, anchor, workdir=None):
     args = [
         str(PROCTOR_SCRIPT),
         "--manifest",
@@ -102,6 +102,8 @@ def _write_mcp_config(run_dir, manifest_path, run_id, state_dir, anchor):
     ]
     if anchor:
         args += ["--anchor", anchor]
+    if workdir:
+        args += ["--workdir", str(Path(workdir).resolve())]
     cfg = {
         "mcpServers": {
             "proctor": {
