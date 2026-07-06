@@ -38,7 +38,7 @@ run_benchmark.py (orchestrator)
   │
   ├─ 2. creates harness/runs/<run_id>/ :
   │       workdir/            - the only directory the agent can touch
-  │         └─ .claude/skills/   (copied from elastic_skills/)
+  │         └─ .claude/skills/   (copied from elastic_skills/, if present)
   │       claude_config/      - fresh scrubbed CLAUDE_CONFIG_DIR
   │       proctor_state/      - where the proctor logs verdicts
   │       mcp_config.json     - tells the agent how to reach the proctor
@@ -77,8 +77,11 @@ harness/
     scoreboard.py
     models.yaml            - model registry
   ccr_transformers/        - small JS fixes for provider-specific request quirks
-  elastic_skills/          - Elastic's official agent-skill packs, bundled so
-                             every model starts with the same capabilities
+  elastic_skills/          - Elastic's official agent-skill packs (optional,
+                             fetched dependency; only the pinned lock file is
+                             tracked, see elastic_skills/README.md). Copied
+                             into every run so all models share the same
+                             capabilities; harness soft-fails if absent.
   elastic/                 - Docker Compose + loader scripts (bundled tooling;
                              the actual scenario telemetry is NOT bundled,
                              see elastic/README.md)
@@ -98,6 +101,10 @@ harness/
   (`ccr`) installed and on `PATH` if you'll test any non-Anthropic model.
 - **Scenario telemetry data** for whatever scenario you're running — not
   bundled, see `elastic/README.md`.
+- **(Optional) Elastic agent skills** — not bundled; populate `elastic_skills/`
+  from the pinned `skills-lock.json` to give every model the pre-built
+  Elastic capabilities. The harness runs fine without them (models fall back
+  to shell + `curl`). See `elastic_skills/README.md`.
 
 **Note on scenario content:** the questions and telemetry themselves are not
 this project's IP (in the reference deployment, they come from BiZone

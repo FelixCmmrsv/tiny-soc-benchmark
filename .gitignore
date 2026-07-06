@@ -27,5 +27,14 @@ elastic/telemetry/data_*/
 scenario_artifacts/*/
 !scenario_artifacts/README.md
 
+# Elastic's official agent-skill packs (author: elastic, from the
+# elastic/agent-skills repo). A fetched dependency, not our content --
+# only the pinned lock file and the README are tracked; the skill payloads
+# are populated locally. See elastic_skills/README.md.
+elastic_skills/*/
+elastic_skills/*
+!elastic_skills/README.md
+!elastic_skills/skills-lock.json
+
 __pycache__/
 *.pyc
