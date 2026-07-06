@@ -30,7 +30,18 @@ import capability_profiles
 import ccr_manager
 import elastic_lifecycle
 import isolation
+import proctor_manager
 import scoreboard
+
+SANDBOX_IMAGE = "harness-sandbox:latest"
+
+
+def _container_url(url):
+    """Rewrite a host-localhost URL to what the agent's container must use to
+    reach the same service on the host."""
+    if not url:
+        return url
+    return url.replace("localhost", "host.docker.internal").replace("127.0.0.1", "host.docker.internal")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 HARNESS = REPO_ROOT / "harness"
@@ -171,6 +182,66 @@ def build_claude_command(run, model_cfg, manifest, max_budget_usd, conn, ccr_han
     return cmd, env
 
 
+def build_docker_command(run, model_cfg, manifest, max_budget_usd, conn, proctor_port, ccr_handle=None):
+    """Contained variant: the agent runs inside the sandbox container with ONLY
+    its workdir mounted -- no host filesystem, so no plaintext answer key to
+    find. It reaches the proctor / Elasticsearch / ccr on the host via
+    host.docker.internal. The manifest (answer key) never enters the container.
+    """
+    system_addendum = (HARNESS / "proctor" / "system_prompt_addendum.txt").read_text()
+    # ES/Kibana URLs the CONTAINER must use (host.docker.internal, not localhost).
+    c_conn = dict(conn)
+    c_conn["es_url"] = _container_url(conn["es_url"])
+    c_conn["kibana_url"] = _container_url(conn["kibana_url"])
+    prompt = build_initial_prompt(manifest, c_conn)
+    model_arg = ccr_handle["router_key"] if ccr_handle else model_cfg["model"]
+
+    # MCP config the container reads -- points at the host proctor over HTTP.
+    mcp_cfg = {"mcpServers": {"proctor": {"type": "http",
+               "url": "http://host.docker.internal:%d/mcp" % proctor_port}}}
+    (run["workdir"] / "mcp_config.json").write_text(json.dumps(mcp_cfg, indent=2))
+
+    docker = [
+        "docker", "run", "--rm", "--name", "harness_%s" % run["run_id"],
+        "-v", "%s:/work" % run["workdir"].resolve(),
+        "-w", "/work",
+    ]
+    # Env into the container.
+    denv = {}
+    if ccr_handle:
+        denv["ANTHROPIC_BASE_URL"] = "http://host.docker.internal:%s" % ccr_handle["port"]
+        denv["ANTHROPIC_AUTH_TOKEN"] = "routed-via-ccr-placeholder"
+    else:
+        denv["CLAUDE_CODE_OAUTH_TOKEN"] = load_claude_oauth_token()
+    if conn["es_api_key"]:
+        denv["ES_API_KEY"] = conn["es_api_key"]
+    if conn["es_user"]:
+        denv["ES_USER"] = conn["es_user"]
+    if conn["es_password"]:
+        denv["ES_PASSWORD"] = conn["es_password"]
+    for k, v in denv.items():
+        docker += ["-e", "%s=%s" % (k, v)]
+    docker += [SANDBOX_IMAGE]
+
+    claude = [
+        "claude", "-p",
+        "--mcp-config", "/work/mcp_config.json", "--strict-mcp-config",
+        "--permission-mode", "bypassPermissions",
+        "--no-session-persistence",
+        "--output-format", "stream-json", "--verbose",
+        "--model", model_arg,
+        "--max-budget-usd", str(max_budget_usd),
+        "--add-dir", "/work",
+        "--disallowedTools", "WebSearch,WebFetch",
+        "--append-system-prompt", system_addendum,
+    ]
+    if model_cfg.get("effort"):
+        claude += ["--effort", model_cfg["effort"]]
+    claude += [prompt]
+
+    return docker + claude, dict(os.environ)
+
+
 def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, conn):
     print("\n=== Job: scenario=%s model=%s ===" % (scenario_id, model_name))
 
@@ -197,18 +268,23 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, c
         # files already exist -- just show the shape of what would run.
         router_key = "%s,%s" % (model_cfg["provider_name"], model_cfg["model"]) if not model_cfg.get("native") else None
         fake_ccr_handle = {"port": "<ccr-port>", "router_key": router_key} if router_key else None
-        cmd, env = build_claude_command(run, model_cfg, manifest, args.max_budget_usd,
-                                         conn, fake_ccr_handle)
-        print("[dry-run] would execute:")
+        if args.sandbox:
+            cmd, _ = build_docker_command(run, model_cfg, manifest, args.max_budget_usd,
+                                          conn, 0, fake_ccr_handle)
+            print("[dry-run] CONTAINED -- would start host HTTP proctor + execute:")
+        else:
+            cmd, env = build_claude_command(run, model_cfg, manifest, args.max_budget_usd,
+                                            conn, fake_ccr_handle)
+            print("[dry-run] would execute:")
         print(" ".join(_shell_quote(c) for c in cmd))
-        print("[dry-run] CLAUDE_CONFIG_DIR=%s" % env["CLAUDE_CONFIG_DIR"])
         if fake_ccr_handle:
-            print("[dry-run] would start a per-run ccr instance for provider %s, "
-                  "ANTHROPIC_BASE_URL=http://127.0.0.1:<port>" % model_cfg["provider_name"])
+            print("[dry-run] would start a per-run ccr instance for provider %s"
+                  % model_cfg["provider_name"])
         isolation.cleanup_run(run["run_dir"], keep=True)
         return None
 
     ccr_handle = None
+    proctor_handle = None
     try:
         if not model_cfg.get("native"):
             print("[run_benchmark] starting per-run ccr instance for provider %s..." % model_cfg["provider_name"])
@@ -216,20 +292,35 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, c
             print("[run_benchmark] ccr ready on port %d (router key %s)"
                   % (ccr_handle["port"], ccr_handle["router_key"]))
 
-        cmd, env = build_claude_command(run, model_cfg, manifest, args.max_budget_usd,
-                                         conn, ccr_handle)
+        if args.sandbox:
+            print("[run_benchmark] CONTAINED run: starting host HTTP proctor + docker sandbox...")
+            proctor_handle = proctor_manager.start(manifest_path, run["run_id"],
+                                                   run["state_dir"], run["workdir"], anchor)
+            print("[run_benchmark] proctor (host) on port %d; agent runs in %s"
+                  % (proctor_handle["port"], SANDBOX_IMAGE))
+            cmd, env = build_docker_command(run, model_cfg, manifest, args.max_budget_usd,
+                                            conn, proctor_handle["port"], ccr_handle)
+            cwd = None
+        else:
+            cmd, env = build_claude_command(run, model_cfg, manifest, args.max_budget_usd,
+                                            conn, ccr_handle)
+            cwd = str(run["workdir"])
 
         transcript_path = run["run_dir"] / "transcript.jsonl"
         stderr_path = run["run_dir"] / "stderr.log"
         t0 = time.time()
         timed_out = False
         with open(transcript_path, "wb") as out_f, open(stderr_path, "wb") as err_f:
-            proc = subprocess.Popen(cmd, cwd=str(run["workdir"]), env=env, stdout=out_f, stderr=err_f)
+            proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out_f, stderr=err_f)
             try:
                 proc.wait(timeout=args.timeout_minutes * 60)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 print("[run_benchmark] TIMEOUT after %d min -- terminating" % args.timeout_minutes)
+                if args.sandbox:
+                    # killing the `docker run` client doesn't stop the container
+                    subprocess.run(["docker", "kill", "harness_%s" % run["run_id"]],
+                                   capture_output=True)
                 proc.terminate()
                 try:
                     proc.wait(timeout=15)
@@ -238,6 +329,8 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, c
                     proc.wait()
         duration_s = time.time() - t0
     finally:
+        if proctor_handle:
+            proctor_manager.stop(proctor_handle)
         if ccr_handle:
             ccr_manager.stop(ccr_handle)
 
@@ -327,6 +420,12 @@ def main():
                      help="Don't run the local `docker compose up`; target an already-running "
                           "or remote Elasticsearch/Kibana (configure its URL/auth in elastic/.env "
                           "or via --es-url/--kibana-url).")
+    ap.add_argument("--sandbox", action="store_true",
+                     help="Run the agent inside the Docker sandbox (harness-sandbox:latest) with "
+                          "NO host filesystem access -- the proctor runs on the host over HTTP so "
+                          "the answer key can't be read off disk. The only leak-safe mode; required "
+                          "for a trustworthy score. Build the image once: "
+                          "docker build -t harness-sandbox:latest harness/sandbox/")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep-workdir", action="store_true")
     ap.add_argument("--list-scenarios", action="store_true")

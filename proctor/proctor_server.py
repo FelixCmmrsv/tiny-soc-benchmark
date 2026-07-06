@@ -80,11 +80,18 @@ class ProctorState:
         self.results_path = os.path.join(state_dir, "results.jsonl")
 
     def _sync_artifacts(self):
-        """Symlink (not copy -- some of these are many GB) every artifact
-        unlocked as of the current step into the agent's workdir, if not
-        already there. Returns the mount_as names unlocked so far (earlier
-        artifacts stay listed/available once unlocked, matching how the
-        original scenario worked)."""
+        """Make every artifact unlocked as of the current step available in
+        the agent's workdir, if not already there. Returns the mount_as names
+        unlocked so far (earlier artifacts stay available once unlocked).
+
+        HARDLINK (not symlink) is deliberate and load-bearing for isolation:
+        a symlink would let the agent `readlink`/`realpath` it and discover
+        the real source path -- which sits inside the project tree next to the
+        plaintext answer key. A hardlink is just another directory entry for
+        the same inode with NO back-reference to the source's location, so it
+        exposes nothing. It also works across a Docker bind-mount (the agent
+        sees a real file, not a dangling host symlink). Falls back to a copy
+        only across filesystems, where hardlinks aren't possible."""
         if not self.workdir:
             return []
         unlocked = []
@@ -97,12 +104,17 @@ class ProctorState:
             dst = self.workdir / mount_as
             if dst.exists() or dst.is_symlink():
                 continue
-            src = scenario_root / a["source_path"]
+            src = (scenario_root / a["source_path"]).resolve()  # resolve() collapses any operator symlink to the real file
             if not src.exists():
                 log_err("proctor: WARNING artifact source missing, not unlocked: %s" % src)
                 continue
-            os.symlink(src.resolve(), dst)
-            log_err("proctor: unlocked artifact %s -> %s" % (mount_as, src))
+            try:
+                os.link(src, dst)
+                log_err("proctor: unlocked artifact %s (hardlink)" % mount_as)
+            except OSError:
+                import shutil as _sh
+                _sh.copy2(src, dst)
+                log_err("proctor: unlocked artifact %s (copy -- cross-filesystem)" % mount_as)
         return unlocked
 
     def current_step_public(self):
@@ -240,35 +252,32 @@ def log_err(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-def handle_message(msg, state):
+def process_message(msg, state):
+    """Pure JSON-RPC handler: returns the response dict, or None for
+    notifications / messages that expect no reply. Transport-agnostic -- used
+    by both the stdio loop and the HTTP server."""
     method = msg.get("method")
     has_id = "id" in msg
     msg_id = msg.get("id")
 
     if method == "initialize":
-        send(
-            {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "bizone-proctor", "version": "0.1.0"},
-                },
-            }
-        )
-        return
+        return {
+            "jsonrpc": "2.0", "id": msg_id,
+            "result": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "bizone-proctor", "version": "0.1.0"},
+            },
+        }
 
     if method == "notifications/initialized":
-        return  # notification, no response
+        return None  # notification, no response
 
     if method == "ping":
-        send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
-        return
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
     if method == "tools/list":
-        send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
-        return
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
 
     if method == "tools/call":
         params = msg.get("params") or {}
@@ -280,39 +289,91 @@ def handle_message(msg, state):
             elif name == "submit_answer":
                 result = state.submit(arguments.get("answer", ""))
             else:
-                send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "error": {"code": -32601, "message": "Unknown tool: %s" % name},
-                    }
-                )
-                return
+                return {"jsonrpc": "2.0", "id": msg_id,
+                        "error": {"code": -32601, "message": "Unknown tool: %s" % name}}
         except Exception as e:  # never let a bug crash the whole proctor mid-run
             log_err("proctor tool error:", repr(e))
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "result": {
-                        "content": [{"type": "text", "text": "internal proctor error: %s" % e}],
-                        "isError": True,
-                    },
-                }
-            )
-            return
-        send(
-            {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]},
-            }
-        )
-        return
+            return {"jsonrpc": "2.0", "id": msg_id,
+                    "result": {"content": [{"type": "text", "text": "internal proctor error: %s" % e}],
+                               "isError": True}}
+        return {"jsonrpc": "2.0", "id": msg_id,
+                "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}}
 
-    # unknown method: error only if it expected a reply
     if has_id:
-        send({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Method not found: %s" % method}})
+        return {"jsonrpc": "2.0", "id": msg_id,
+                "error": {"code": -32601, "message": "Method not found: %s" % method}}
+    return None
+
+
+def run_stdio(state):
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception as e:
+            log_err("proctor: bad JSON line, ignored:", repr(e))
+            continue
+        try:
+            resp = process_message(msg, state)
+            if resp is not None:
+                send(resp)
+        except Exception as e:
+            log_err("proctor: unhandled error:", repr(e))
+
+
+def run_http(state, host, port):
+    """Serve MCP over Streamable HTTP so the proctor can run on the HOST,
+    holding the answer key, while a containerized agent calls it over the
+    network -- the manifest never enters the agent's container. Minimal
+    JSON-response implementation (no server-initiated SSE needed for a
+    tools-only server)."""
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _reply(self, status, obj=None):
+            body = b"" if obj is None else json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            if obj is not None:
+                self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            # Advertise a session id -- some MCP HTTP clients require the header.
+            self.send_header("Mcp-Session-Id", state.run_id)
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._reply(400, {"jsonrpc": "2.0", "id": None,
+                                  "error": {"code": -32700, "message": "Parse error"}})
+                return
+            # A JSON-RPC notification (no id) -> 202 Accepted, empty body.
+            resp = process_message(msg, state)
+            if resp is None:
+                self._reply(202, None)
+            else:
+                self._reply(200, resp)
+
+        def do_GET(self):
+            # Clients may open a GET for a server->client SSE stream; we don't
+            # push, so decline cleanly.
+            self._reply(405, {"jsonrpc": "2.0", "id": None,
+                              "error": {"code": -32000, "message": "SSE stream not supported"}})
+
+        def log_message(self, *a):
+            pass  # keep the proctor quiet; it logs to stderr via log_err
+
+    httpd = http.server.ThreadingHTTPServer((host, port), Handler)
+    log_err("proctor: HTTP transport listening on %s:%d (path: any; POST JSON-RPC)" % (host, port))
+    httpd.serve_forever()
 
 
 def main():
@@ -327,29 +388,26 @@ def main():
                      help="ISO timestamp used as the scenario's 'ends now' anchor for this run "
                           "(same value passed to upload.sh --anchor) -- needed to grade any "
                           "shift_from_source timestamp questions correctly.")
+    ap.add_argument("--transport", choices=["stdio", "http"], default="stdio",
+                     help="stdio (default; proctor is a subprocess of the agent CLI) or http "
+                          "(proctor runs on the host as a network service so a containerized "
+                          "agent can call it without the manifest ever entering the container).")
+    ap.add_argument("--host", default="0.0.0.0", help="HTTP bind host (http transport only).")
+    ap.add_argument("--port", type=int, default=0, help="HTTP bind port (http transport only).")
     args = ap.parse_args()
 
     manifest = load_manifest(args.manifest)
     materialize_shifted_timestamps(manifest, args.anchor)
     state = ProctorState(manifest, args.run_id, args.state_dir, args.workdir)
     log_err(
-        "proctor: loaded scenario=%s steps=%d run_id=%s state_dir=%s"
-        % (manifest["scenario_id"], len(manifest["steps"]), args.run_id, args.state_dir)
+        "proctor: loaded scenario=%s steps=%d run_id=%s transport=%s"
+        % (manifest["scenario_id"], len(manifest["steps"]), args.run_id, args.transport)
     )
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except Exception as e:
-            log_err("proctor: bad JSON line, ignored:", repr(e))
-            continue
-        try:
-            handle_message(msg, state)
-        except Exception as e:
-            log_err("proctor: unhandled error:", repr(e))
+    if args.transport == "http":
+        run_http(state, args.host, args.port)
+    else:
+        run_stdio(state)
 
 
 if __name__ == "__main__":
