@@ -26,7 +26,7 @@ def _free_port():
     return port
 
 
-def start(manifest_path, run_id, state_dir, workdir, anchor, timeout=15):
+def start(manifest_path, run_id, state_dir, workdir, anchor, resume=False, timeout=15):
     """Spawn the HTTP proctor on the host, bound to 0.0.0.0 so the agent's
     container can reach it via host.docker.internal. Returns a handle dict."""
     port = _free_port()
@@ -40,6 +40,8 @@ def start(manifest_path, run_id, state_dir, workdir, anchor, timeout=15):
     ]
     if anchor:
         args += ["--anchor", anchor]
+    if resume:
+        args += ["--resume"]
 
     log_path = Path(state_dir) / "proctor.log"
     log_f = open(log_path, "wb")

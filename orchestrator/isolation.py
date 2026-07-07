@@ -66,6 +66,11 @@ def create_run(scenario_id, model_name, manifest_path, anchor):
 
     mcp_config_path = _write_mcp_config(run_dir, manifest_path, run_id, state_dir, anchor, workdir)
 
+    # Persist the anchor so a --resume of this run reuses the SAME shift the
+    # Elastic data was loaded with (re-resetting with a new anchor would
+    # break shift_from_source grading).
+    (run_dir / "anchor.txt").write_text(anchor or "")
+
     return {
         "run_id": run_id,
         "run_dir": run_dir,
@@ -75,6 +80,33 @@ def create_run(scenario_id, model_name, manifest_path, anchor):
         "mcp_config_path": mcp_config_path,
         "results_path": state_dir / "results.jsonl",
     }
+
+
+def load_run(run_id):
+    """Reconstruct the run dict for an existing run WITHOUT creating or
+    cleaning anything -- used by --resume so the accumulated workdir (e.g. an
+    extracted disk image) and proctor_state survive across restarts. Returns
+    (run_dict, anchor)."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.is_dir():
+        raise IsolationError("cannot resume: no run dir at %s" % run_dir)
+    workdir = run_dir / "workdir"
+    state_dir = run_dir / "proctor_state"
+    if not workdir.is_dir() or not state_dir.is_dir():
+        raise IsolationError("cannot resume %s: workdir/proctor_state missing (was it cleaned? "
+                             "resume needs --keep-workdir runs)" % run_id)
+    anchor_file = run_dir / "anchor.txt"
+    anchor = anchor_file.read_text().strip() if anchor_file.exists() else None
+    run = {
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "workdir": workdir,
+        "state_dir": state_dir,
+        "claude_config": run_dir / "claude_config",
+        "mcp_config_path": run_dir / "mcp_config.json",
+        "results_path": state_dir / "results.jsonl",
+    }
+    return run, anchor
 
 
 def _seed_skills(workdir):

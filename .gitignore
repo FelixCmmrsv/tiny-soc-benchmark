@@ -38,3 +38,4 @@ elastic_skills/*
 
 __pycache__/
 *.pyc
+tools/run_scenario2_supervised.sh

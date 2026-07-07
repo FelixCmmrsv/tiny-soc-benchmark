@@ -182,7 +182,7 @@ def build_claude_command(run, model_cfg, manifest, max_budget_usd, conn, ccr_han
     return cmd, env
 
 
-def build_docker_command(run, model_cfg, manifest, max_budget_usd, conn, proctor_port, ccr_handle=None):
+def build_docker_command(run, model_cfg, manifest, max_budget_usd, conn, proctor_port, ccr_handle=None, resuming=False):
     """Contained variant: the agent runs inside the sandbox container with ONLY
     its workdir mounted -- no host filesystem, so no plaintext answer key to
     find. It reaches the proctor / Elasticsearch / ccr on the host via
@@ -194,6 +194,11 @@ def build_docker_command(run, model_cfg, manifest, max_budget_usd, conn, proctor
     c_conn["es_url"] = _container_url(conn["es_url"])
     c_conn["kibana_url"] = _container_url(conn["kibana_url"])
     prompt = build_initial_prompt(manifest, c_conn)
+    if resuming:
+        prompt += (" NOTE: this is a resumed session -- your working directory "
+                   "/work may already contain files and extracted artifacts (e.g. a "
+                   "mounted/unpacked disk image) from earlier analysis of this same "
+                   "scenario. Reuse them; you do not need to re-download or re-extract.")
     model_arg = ccr_handle["router_key"] if ccr_handle else model_cfg["model"]
 
     # MCP config the container reads -- points at the host proctor over HTTP.
@@ -205,6 +210,12 @@ def build_docker_command(run, model_cfg, manifest, max_budget_usd, conn, proctor
         "docker", "run", "--rm", "--name", "harness_%s" % run["run_id"],
         "-v", "%s:/work" % run["workdir"].resolve(),
         "-w", "/work",
+        # Bound the container's memory so a forensic spike (e.g. hashcat, or
+        # a big image load) can't OOM-kill the whole Docker VM and take
+        # Elasticsearch down with it. Swap headroom lets tools that briefly
+        # exceed RAM continue instead of dying outright.
+        "--memory", os.environ.get("HARNESS_SANDBOX_MEM", "4g"),
+        "--memory-swap", os.environ.get("HARNESS_SANDBOX_MEMSWAP", "8g"),
     ]
     # Env into the container.
     denv = {}
@@ -242,17 +253,33 @@ def build_docker_command(run, model_cfg, manifest, max_budget_usd, conn, proctor
     return docker + claude, dict(os.environ)
 
 
-def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, conn):
-    print("\n=== Job: scenario=%s model=%s ===" % (scenario_id, model_name))
+def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, conn, resume_run_id=None):
+    print("\n=== Job: scenario=%s model=%s%s ==="
+          % (scenario_id, model_name, " (RESUME)" if resume_run_id else ""))
 
-    # One anchor for this whole job, shared by the Elastic reset and the
-    # proctor's timestamp-shift grading -- computed once here so both sides
-    # agree exactly, instead of each independently defaulting to "now" at
-    # slightly different wall-clock moments.
-    anchor = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    resuming = bool(resume_run_id)
+    if resuming:
+        # Reuse the existing run (accumulated workdir + proctor_state) and the
+        # anchor it was loaded with -- NO Elastic reset (re-shifting with a new
+        # anchor would break shift_from_source grading against already-loaded
+        # data).
+        run, anchor = isolation.load_run(resume_run_id)
+        already = 0
+        if run["results_path"].exists():
+            already = sum(1 for l in run["results_path"].read_text().splitlines() if l.strip())
+        print("[run_benchmark] resuming run_id=%s: %d/%d already answered, anchor=%s"
+              % (resume_run_id, already, len(manifest["steps"]), anchor))
+    else:
+        # One anchor for this whole job, shared by the Elastic reset and the
+        # proctor's timestamp-shift grading -- computed once here so both sides
+        # agree exactly, instead of each independently defaulting to "now" at
+        # slightly different wall-clock moments.
+        anchor = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     if args.dry_run:
         pass  # dry-run is side-effect-free: no Elastic reset, no ccr, no agent
+    elif resuming:
+        print("[run_benchmark] resume: skipping Elastic reset (reusing loaded data + anchor)")
     elif not args.no_recreate_elastic:
         elastic_lifecycle.reset_scenario_data(
             manifest, anchor, es_url=conn["es_url"], kibana_url=conn["kibana_url"],
@@ -260,7 +287,8 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, c
     else:
         print("[run_benchmark] skipping Elastic reset (--no-recreate-elastic)")
 
-    run = isolation.create_run(scenario_id, model_name, manifest_path, anchor)
+    if not resuming:
+        run = isolation.create_run(scenario_id, model_name, manifest_path, anchor)
     print("[run_benchmark] run_id=%s run_dir=%s" % (run["run_id"], run["run_dir"]))
 
     if args.dry_run:
@@ -295,11 +323,12 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, c
         if args.sandbox:
             print("[run_benchmark] CONTAINED run: starting host HTTP proctor + docker sandbox...")
             proctor_handle = proctor_manager.start(manifest_path, run["run_id"],
-                                                   run["state_dir"], run["workdir"], anchor)
+                                                   run["state_dir"], run["workdir"], anchor,
+                                                   resume=resuming)
             print("[run_benchmark] proctor (host) on port %d; agent runs in %s"
                   % (proctor_handle["port"], SANDBOX_IMAGE))
             cmd, env = build_docker_command(run, model_cfg, manifest, args.max_budget_usd,
-                                            conn, proctor_handle["port"], ccr_handle)
+                                            conn, proctor_handle["port"], ccr_handle, resuming=resuming)
             cwd = None
         else:
             cmd, env = build_claude_command(run, model_cfg, manifest, args.max_budget_usd,
@@ -337,7 +366,10 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, c
     summary = summarize_run(scenario_id, model_name, run, manifest, duration_s, timed_out, proc.returncode)
     (run["run_dir"] / "result_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
 
-    if not args.keep_workdir:
+    # A resumable run must keep its workdir (the accumulated / extracted state)
+    # for the next window; only a genuinely finished run may be cleaned.
+    finished = summarize_run(scenario_id, model_name, run, manifest, 0, False, 0)["steps_answered"] >= len(manifest["steps"])
+    if not args.keep_workdir and (finished or not resuming):
         # keep proctor_state/results.jsonl + summary + transcript; only drop the
         # scrubbed config-dir copies and scratch workdir (nothing worth keeping
         # once the run is graded, and they're the largest part of the run dir).
@@ -426,6 +458,11 @@ def main():
                           "the answer key can't be read off disk. The only leak-safe mode; required "
                           "for a trustworthy score. Build the image once: "
                           "docker build -t harness-sandbox:latest harness/sandbox/")
+    ap.add_argument("--resume", default=None, metavar="RUN_ID",
+                     help="Continue an interrupted contained run: reuse its workdir (extracted "
+                          "state) + anchor, skip the Elastic reset, and pick up at the next "
+                          "unanswered question. Requires --sandbox and a --keep-workdir'd run. "
+                          "Scenario/model are taken from the run id.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep-workdir", action="store_true")
     ap.add_argument("--list-scenarios", action="store_true")
@@ -449,10 +486,21 @@ def main():
         print_models()
         return
 
-    if not args.scenario or not args.model:
-        ap.error("--scenario and --model are required (or use --list-scenarios / --list-models)")
-
     models = load_models()
+
+    if args.resume:
+        # Resume derives scenario + model from the run id (scenario__model__hash).
+        if not args.sandbox:
+            ap.error("--resume requires --sandbox (resume only applies to contained runs).")
+        parts = args.resume.split("__")
+        if len(parts) < 3:
+            ap.error("--resume expects a run id like scenario__model__hash, got %r" % args.resume)
+        args.scenario = [parts[0]]
+        args.model = [parts[1]]
+
+    if not args.scenario or not args.model:
+        ap.error("--scenario and --model are required (or use --list-scenarios / --list-models / --resume)")
+
     for m in args.model:
         if m not in models:
             ap.error("Unknown model %r. Known: %s" % (m, ", ".join(models)))
@@ -477,17 +525,20 @@ def main():
     for scenario_id in args.scenario:
         manifest, manifest_path = load_manifest(scenario_id)
         manifests[scenario_id] = (manifest, manifest_path)
-        try:
-            capability_profiles.require(manifest.get("capability_profile", "elastic-only"))
-        except capability_profiles.CapabilityError as e:
-            ap.error(str(e))
+        if not args.sandbox:
+            # For --sandbox the tools live in the image, not the host.
+            try:
+                capability_profiles.require(manifest.get("capability_profile", "elastic-only"))
+            except capability_profiles.CapabilityError as e:
+                ap.error(str(e))
 
     summaries = []
     for scenario_id in args.scenario:
         manifest, manifest_path = manifests[scenario_id]
         for model_name in args.model:
             model_cfg = models[model_name]
-            summary = run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, conn)
+            summary = run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, conn,
+                              resume_run_id=args.resume)
             if summary:
                 summaries.append(summary)
                 print("[run_benchmark] %s x %s -> score %s (%d timed out=%s)"

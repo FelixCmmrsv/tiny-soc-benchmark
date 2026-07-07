@@ -67,7 +67,7 @@ TOOLS = [
 
 
 class ProctorState:
-    def __init__(self, manifest, run_id, state_dir, workdir=None):
+    def __init__(self, manifest, run_id, state_dir, workdir=None, resume=False):
         self.manifest = manifest
         self.run_id = run_id
         self.state_dir = state_dir
@@ -78,6 +78,19 @@ class ProctorState:
         self.complete = False
         os.makedirs(state_dir, exist_ok=True)
         self.results_path = os.path.join(state_dir, "results.jsonl")
+        if resume and os.path.exists(self.results_path):
+            # Continue an interrupted run: one results.jsonl line == one
+            # answered question, so the number of lines is exactly how many
+            # steps to skip. get_current_step then serves the next unanswered
+            # question. This lets a run survive repeated environment kills --
+            # progress accumulates across restarts instead of starting over.
+            with open(self.results_path, encoding="utf-8") as f:
+                answered = sum(1 for line in f if line.strip())
+            self.idx = min(answered, len(self.steps))
+            self.started = self.idx > 0
+            self.complete = self.idx >= len(self.steps)
+            log_err("proctor: RESUME -- %d/%d already answered, continuing from step %d"
+                    % (self.idx, len(self.steps), self.idx + 1 if not self.complete else self.idx))
 
     def _sync_artifacts(self):
         """Make every artifact unlocked as of the current step available in
@@ -394,11 +407,14 @@ def main():
                           "agent can call it without the manifest ever entering the container).")
     ap.add_argument("--host", default="0.0.0.0", help="HTTP bind host (http transport only).")
     ap.add_argument("--port", type=int, default=0, help="HTTP bind port (http transport only).")
+    ap.add_argument("--resume", action="store_true",
+                     help="Continue from the existing results.jsonl in --state-dir (skip already-"
+                          "answered questions) instead of starting at question 1.")
     args = ap.parse_args()
 
     manifest = load_manifest(args.manifest)
     materialize_shifted_timestamps(manifest, args.anchor)
-    state = ProctorState(manifest, args.run_id, args.state_dir, args.workdir)
+    state = ProctorState(manifest, args.run_id, args.state_dir, args.workdir, resume=args.resume)
     log_err(
         "proctor: loaded scenario=%s steps=%d run_id=%s transport=%s"
         % (manifest["scenario_id"], len(manifest["steps"]), args.run_id, args.transport)
