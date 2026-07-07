@@ -339,7 +339,10 @@ def run_job(scenario_id, manifest, manifest_path, model_name, model_cfg, args, c
         stderr_path = run["run_dir"] / "stderr.log"
         t0 = time.time()
         timed_out = False
-        with open(transcript_path, "wb") as out_f, open(stderr_path, "wb") as err_f:
+        # Append on resume so each window's transcript is preserved (each line
+        # is independent JSON; usage extraction sums across all windows).
+        file_mode = "ab" if resuming else "wb"
+        with open(transcript_path, file_mode) as out_f, open(stderr_path, file_mode) as err_f:
             proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out_f, stderr=err_f)
             try:
                 proc.wait(timeout=args.timeout_minutes * 60)

@@ -207,6 +207,14 @@ python3 harness/orchestrator/run_benchmark.py \
 ```
 
 Useful flags:
+- `--sandbox` — **run the agent inside the Docker sandbox with no host
+  filesystem access. This is the only leak-safe mode** (see "Security model").
+  Build the image once: `docker build -t harness-sandbox:latest harness/sandbox/`.
+- `--resume <run_id>` — continue an interrupted `--sandbox` run from the next
+  unanswered question, reusing its workdir (extracted state) and anchor. Needs
+  a `--keep-workdir` run. Lets a long run accumulate to completion across
+  restarts if the environment kills it partway. Scenario/model come from the
+  run id.
 - `--no-recreate-elastic` — skip the Elastic reload (repeat runs against data
   you know is already loaded).
 - `--no-compose` — don't start the local Docker stack; target an existing /
@@ -214,12 +222,19 @@ Useful flags:
   See `elastic/README.md` → "Option B".
 - `--es-url` / `--kibana-url` — override the cluster URLs for this run
   (precedence: these flags → `elastic/.env` → localhost default).
-- `--keep-workdir` — keep the per-run scrubbed config dirs/workdir for
-  debugging instead of deleting them after grading (`proctor_state/results.jsonl`,
-  `transcript.jsonl`, and `result_summary.json` are always kept regardless).
+- `--keep-workdir` — keep the per-run workdir for debugging or `--resume`
+  (`proctor_state/results.jsonl`, `transcript.jsonl`, and `result_summary.json`
+  are always kept regardless).
 
 `--dry-run` is fully side-effect-free: it prints the exact command that would
 run and does not touch Elasticsearch, start `ccr`, or spend anything.
+
+**Which mode to use.** `--sandbox` is the trustworthy one and what you should
+use for any real measurement — the host mode (default) runs the agent as a
+host subprocess with full shell access, so on a machine that also holds the
+plaintext answer sources (the private `manifest.source.yaml`, or any other
+copy of the answers) a capable agent can read them off disk. See "Security
+model".
 
 ### Output
 
@@ -302,17 +317,29 @@ python3 harness/tools/compile_manifest.py harness/scenarios/my_scenario
 Two distinct threats, two distinct layers:
 
 **The model under test, during its own run, must never see the answer
-key.** The manifest lives outside any path the agent's sandbox can reach,
-loaded solely by the proctor. The agent only ever sees one question at a
+key.** The proctor holds the manifest and hands the agent one question at a
 time via tool results; submission is one-shot (no retries, no correctness
-feedback — nothing to fish for); every run gets a fresh scrubbed config dir
-(no prior session transcripts, shell history, or task state carried over).
-`isolation.assert_manifest_not_reachable()` refuses to start if it detects
-the manifest path overlapping the agent's sandbox root — checked at
-runtime, not just by convention. This is process-level isolation, not a
-hard sandbox: nothing here stops a sufficiently exploratory agent from
-reading arbitrary paths on the host via its shell tools. Full containment
-(Docker, restricted network egress) is a known gap, not yet built.
+feedback — nothing to fish for).
+
+The strength of this depends on the mode, and this is a lesson learned the
+hard way — a real run once scored a bogus 46/50 because the agent, with host
+shell access, simply read the plaintext answer key (`manifest.source.yaml`
+and a stray copy elsewhere on disk) instead of solving anything:
+
+- **Host mode (default):** the agent is a host subprocess. It runs with a
+  fresh scrubbed config dir and `assert_manifest_not_reachable()` refuses to
+  start if the compiled manifest overlaps the workdir — but the agent's
+  shell can still read arbitrary host paths, so if a plaintext copy of the
+  answers exists anywhere on that machine (the private
+  `manifest.source.yaml`, an author's notes), a capable agent can find it.
+  Only safe on a host that holds no plaintext answers.
+- **`--sandbox` (trustworthy):** the agent runs in a Docker container with
+  **only its workdir mounted** — no host filesystem at all. The proctor runs
+  on the host as an HTTP service and the container reaches it (plus
+  Elasticsearch and the model API) over `host.docker.internal`; the answer
+  key never enters the container. Verified: from inside, every host answer
+  path returns "no such file". Artifacts are hardlinked into the workdir (no
+  symlink revealing a host path). This is the mode to use for any real score.
 
 **A third party who receives this harness + a scenario to self-host, and
 might try to extract the answer key from the file itself** (e.g. to
@@ -337,9 +364,13 @@ provider API keys in plaintext during testing; it's disabled at the source
 
 ## Known limitations
 
-- Cost/usage tracking is accurate for native models only (see "Output" above).
-- Process-level isolation only — see "Security model" above.
-- The `elastic-forensics` capability profile checks for the required tools but
-  runs them on the host; there's no containerized forensics sandbox yet, and
-  the disk-image half of the supply-chain scenario hasn't been run end-to-end
-  with a live model.
+- Cost/usage tracking is accurate for native models only (see "Output" above);
+  routed models are metered by their own provider, invisible to the harness.
+- The default (host) mode is not leak-safe on a machine that holds plaintext
+  answers — use `--sandbox` for any real measurement (see "Security model").
+- The `--sandbox` container reaches Elasticsearch, the model API, and the
+  proctor over the network; egress isn't otherwise restricted (the answer key
+  isn't on any reachable service, so this isn't a leak path, but it's not a
+  locked-down network either).
+- The salted-hash answer protection stops casual peeking, not a determined
+  local brute-force over low-entropy answers (see "Security model").
